@@ -85,3 +85,45 @@ class TicketHistory(models.Model):
     new_value = models.CharField(max_length=255, blank=True, default="")
 
     created_at = models.DateTimeField(auto_now_add=True)
+
+
+#==========================
+# second adding
+#==========================
+class NotificationStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    SENT = "sent", "Sent"
+    FAILED = "failed", "Failed"
+
+
+class NotificationOutbox(models.Model):
+    """
+    Outbox pattern (DB queue).
+    Celery/Redis bo‘lmasa ham background job konseptini ko‘rsatadi.
+
+    Keyin production’da:
+      - worker = celery task
+      - yoki cron/scheduler => manage.py process_outbox
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    to_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="outbox_notifications",
+    )
+    event = models.CharField(max_length=64)  # e.g. "ticket_created", "ticket_resolved"
+    payload = models.JSONField(default=dict)  # lightweight structured data
+
+    status = models.CharField(max_length=16, choices=NotificationStatus.choices, default=NotificationStatus.PENDING)
+    attempts = models.PositiveIntegerField(default=0)
+
+    last_error = models.TextField(blank=True, default="")
+    read_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+
+
+
+

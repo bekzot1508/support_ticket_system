@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Ticket, TicketMessage, TicketHistory
+from .models import Ticket, TicketMessage, TicketHistory, NotificationOutbox
 
 
 @admin.register(Ticket)
@@ -21,4 +21,12 @@ class TicketMessageAdmin(admin.ModelAdmin):
 class TicketHistoryAdmin(admin.ModelAdmin):
     list_display = ("id", "ticket", "actor", "field", "old_value", "new_value", "created_at")
     list_filter = ("field",)
+    ordering = ("-created_at",)
+
+
+@admin.register(NotificationOutbox)
+class NotificationOutboxAdmin(admin.ModelAdmin):
+    list_display = ("id", "to_user", "event", "status", "attempts", "created_at", "sent_at")
+    list_filter = ("status", "event")
+    search_fields = ("to_user__username", "event", "payload")
     ordering = ("-created_at",)

@@ -1,7 +1,7 @@
 from django.db.models import QuerySet, Case, When, Value, BooleanField
 from django.utils.dateparse import parse_datetime
 from django.utils import timezone
-from .models import Ticket
+from .models import Ticket, NotificationOutbox
 
 
 def tickets_qs() -> QuerySet:
@@ -72,3 +72,7 @@ def agent_queue_qs(qs: QuerySet) -> QuerySet:
     )
 
     return qs.order_by("-is_overdue", "due_at", "created_at")
+
+
+def notifications_qs():
+    return NotificationOutbox.objects.select_related("to_user")

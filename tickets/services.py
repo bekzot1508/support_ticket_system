@@ -5,9 +5,11 @@ from django.utils import timezone
 
 from common.exceptions import ConflictError, PermissionDenied, NotFoundError
 from users.models import UserRole
-from .models import Ticket, TicketHistory, TicketStatus, TicketMessage
+from .models import Ticket, TicketHistory, TicketStatus, TicketMessage, NotificationOutbox, NotificationStatus
 from .constants import ALLOWED_STATUS_TRANSITIONS, SLA_BY_PRIORITY
 from django.contrib.auth import get_user_model
+from django.db.models import F
+
 
 User = get_user_model()
 
@@ -101,7 +103,18 @@ def change_status(*, ticket_id, actor, new_status: str) -> Ticket:
     if new_status == TicketStatus.RESOLVED:
         ticket.resolved_at = timezone.now()
 
+    if new_status == TicketStatus.RESOLVED:
+        enqueue_notification(
+            to_user=ticket.created_by,
+            event="ticket_resolved",
+            payload={
+                "ticket_id": str(ticket.id),
+                "title": ticket.title,
+            },
+        )
+
     ticket.save(update_fields=["status", "resolved_at", "updated_at"])
+
 
     _history(ticket=ticket, actor=actor, field="status", old=old_status, new=new_status)
 
@@ -177,6 +190,22 @@ def create_ticket(*, actor, title: str, description: str, priority: str) -> Tick
         priority=priority,
         due_at=due_at,
     )
+
+    # Notify all agents (simple). Real systemda: team/queue bo‘yicha target qilinadi.
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+    agents = User.objects.filter(role="agent", is_active=True)
+
+    for a in agents:
+        enqueue_notification(
+            to_user=a,
+            event="ticket_created",
+            payload={
+                "ticket_id": str(ticket.id),
+                "title": ticket.title,
+                "priority": ticket.priority,
+            },
+        )
     return ticket
 
 
@@ -252,3 +281,69 @@ def assign_ticket(*, ticket_id, actor, agent_id):
         _history(ticket=ticket, actor=actor, field="status", old=old_status, new=ticket.status)
 
     return ticket
+
+
+def enqueue_notification(*, to_user, event: str, payload: dict) -> None:
+    """
+    DB outboxga yozib qo‘yamiz.
+    Side-effect safe: request ichida tez, tashqi servisga bog‘liq emas.
+    """
+    NotificationOutbox.objects.create(
+        to_user=to_user,
+        event=event,
+        payload=payload,
+    )
+
+
+@transaction.atomic
+def process_outbox_batch(*, limit: int = 50) -> int:
+    """
+    Pending notificationlarni batch qilib "send" qiladi.
+    select_for_update(skip_locked=True) -> parallel workerlar bo‘lsa ham safe.
+
+    Bu yerda real email yubormaymiz.
+    Production'da bu joyga provider (SES/Sendgrid) ulab qo‘yiladi.
+    """
+    from django.utils import timezone
+
+    qs = (
+        NotificationOutbox.objects
+        .select_for_update(skip_locked=True)
+        .filter(status=NotificationStatus.PENDING)
+        .order_by("created_at")[:limit]
+    )
+
+    processed = 0
+    for n in qs:
+        try:
+            # SIMULATION: "sent" deb belgilaymiz
+            n.status = NotificationStatus.SENT
+            n.sent_at = timezone.now()
+            n.last_error = ""
+            n.save(update_fields=["status", "sent_at", "last_error"])
+
+            processed += 1
+        except Exception as e:
+            # Failure accounting (retryable)
+            n.status = NotificationStatus.FAILED
+            n.attempts = F("attempts") + 1
+            n.last_error = str(e)
+            n.save(update_fields=["status", "attempts", "last_error"])
+
+    return processed
+
+
+from django.utils import timezone
+
+@transaction.atomic
+def acknowledge_notification(*, notification, actor):
+    """
+    Idempotent ack:
+    - Agar oldin read bo‘lgan bo‘lsa qayta yozmaydi
+    """
+    if notification.to_user_id != actor.id:
+        raise PermissionDenied("Cannot acknowledge чужой notification")
+
+    if notification.read_at is None:
+        notification.read_at = timezone.now()
+        notification.save(update_fields=["read_at"])

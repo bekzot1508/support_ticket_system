@@ -41,3 +41,8 @@ class CanWriteTicket(BasePermission):
         if role == "agent":
             return True
         return obj.created_by_id == request.user.id
+
+
+class IsNotificationOwner(BasePermission):
+    def has_object_permission(self, request, view, obj):
+        return obj.to_user_id == request.user.id

@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Ticket, TicketMessage, TicketStatus, TicketPriority
+from .models import Ticket, TicketMessage, TicketStatus, TicketPriority, NotificationOutbox
 
 
 class TicketCreateSerializer(serializers.Serializer):
@@ -91,3 +91,29 @@ class MessageCreateSerializer(serializers.Serializer):
 # new
 class TicketAssignSerializer(serializers.Serializer):
     agent_id = serializers.UUIDField()
+
+
+class NotificationListSerializer(serializers.ModelSerializer):
+    to_user_id = serializers.UUIDField(source="to_user.id", read_only=True)
+
+    class Meta:
+        model = NotificationOutbox
+        fields = [
+            "id",
+            "to_user_id",
+            "event",
+            "payload",
+            "status",
+            "attempts",
+            "created_at",
+            "sent_at",
+            "read_at",
+        ]
+
+
+class NotificationAckSerializer(serializers.Serializer):
+    """
+    Body bo'sh bo'lishi ham mumkin, lekin serializer qoldiramiz:
+    kelajakda 'read_at' o'rniga 'seen' flag kerak bo'lsa shu joydan boshqaramiz.
+    """
+    pass

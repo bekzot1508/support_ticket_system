@@ -4,7 +4,7 @@ from rest_framework.response import Response
 from common.responses import error_response
 from common.exceptions import AppError
 from common.pagination import paginate_queryset
-from .models import Ticket
+from .models import Ticket, NotificationOutbox
 from .serializers import (
     TicketCreateSerializer,
     TicketListItemSerializer,
@@ -13,10 +13,14 @@ from .serializers import (
     MessageCreateSerializer,
     TicketMessageSerializer,
     TicketAssignSerializer,
+    NotificationListSerializer,
+    NotificationAckSerializer,
 )
-from .permissions import CanViewTicket, CanWriteTicket, IsAgentOrAdmin
-from .services import add_message, claim_ticket, change_status, create_ticket, mark_sla_breached_if_needed, assign_ticket
-from .selectors import tickets_qs, apply_ticket_filters, agent_queue_qs
+from .permissions import CanViewTicket, CanWriteTicket, IsAgentOrAdmin, IsNotificationOwner
+from .services import add_message, claim_ticket, change_status, create_ticket, mark_sla_breached_if_needed, \
+    assign_ticket, acknowledge_notification
+from .selectors import tickets_qs, apply_ticket_filters, agent_queue_qs, notifications_qs
+
 
 
 
@@ -234,3 +238,72 @@ class TicketAssignView(APIView):
             return error_response(e)
 
         return Response(TicketListItemSerializer(ticket).data, status=200)
+
+
+class NotificationListView(APIView):
+    """
+    GET /api/notifications?status=sent&page=1&page_size=20
+
+    - faqat o'z notificationlari
+    - filter: status (pending/sent/failed)
+    """
+    def get(self, request):
+        qs = notifications_qs().filter(to_user=request.user).order_by("-created_at")
+
+        status = request.query_params.get("status")
+        if status:
+            qs = qs.filter(status=status)
+
+        page = int(request.query_params.get("page", "1"))
+        page_size = int(request.query_params.get("page_size", "20"))
+        data = paginate_queryset(qs, page=page, page_size=page_size)
+
+        return Response({
+            "page": data["page"],
+            "page_size": data["page_size"],
+            "count": data["count"],
+            "results": NotificationListSerializer(data["results"], many=True).data,
+        })
+
+
+class NotificationDetailView(APIView):
+    """
+    GET /api/notifications/{id}
+    """
+    def get(self, request, notification_id):
+        n = NotificationOutbox.objects.select_related("to_user").get(id=notification_id)
+
+        perm = IsNotificationOwner()
+        if not perm.has_object_permission(request, self, n):
+            return Response({"error": {"code": "PERMISSION_DENIED", "message": "Forbidden", "details": {}}}, status=403)
+
+        return Response(NotificationListSerializer(n).data)
+
+
+class NotificationAckView(APIView):
+    """
+    POST /api/notifications/{id}/ack
+    - read_at set qiladi
+    """
+    def post(self, request, notification_id):
+        # body bo‘sh bo‘lishi mumkin
+        ser = NotificationAckSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response(
+                {"error": {"code": "VALIDATION_ERROR", "message": "Invalid input", "details": ser.errors}},
+                status=400,
+            )
+
+        n = NotificationOutbox.objects.get(id=notification_id)
+
+        perm = IsNotificationOwner()
+        if not perm.has_object_permission(request, self, n):
+            return Response({"error": {"code": "PERMISSION_DENIED", "message": "Forbidden", "details": {}}}, status=403)
+
+        try:
+            acknowledge_notification(notification=n, actor=request.user)
+        except AppError as e:
+            return error_response(e)
+
+        n.refresh_from_db()
+        return Response(NotificationListSerializer(n).data, status=200)

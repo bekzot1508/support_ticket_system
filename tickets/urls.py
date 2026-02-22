@@ -8,6 +8,9 @@ from .views import (
     TicketMessageCreateView,
     AgentQueueView,
     TicketAssignView,
+    NotificationListView,
+    NotificationDetailView,
+    NotificationAckView
 )
 
 urlpatterns = [
@@ -23,4 +26,9 @@ urlpatterns = [
     path("agent/queue/", AgentQueueView.as_view()),
 
     path("tickets/<uuid:ticket_id>/assign/", TicketAssignView.as_view()),
+
+    # notification
+    path("notifications", NotificationListView.as_view()),
+    path("notifications/<uuid:notification_id>", NotificationDetailView.as_view()),
+    path("notifications/<uuid:notification_id>/ack", NotificationAckView.as_view()),
 ]
