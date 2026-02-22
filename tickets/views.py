@@ -3,13 +3,21 @@ from rest_framework.response import Response
 
 from common.responses import error_response
 from common.exceptions import AppError
+from common.pagination import paginate_queryset
 from .models import Ticket
 from .serializers import (
     TicketCreateSerializer,
     TicketListItemSerializer,
     TicketStatusUpdateSerializer,
+    TicketDetailSerializer,
+    MessageCreateSerializer,
+    TicketMessageSerializer,
+    TicketAssignSerializer,
 )
-from .services import claim_ticket, change_status
+from .permissions import CanViewTicket, CanWriteTicket, IsAgentOrAdmin
+from .services import add_message, claim_ticket, change_status, create_ticket, mark_sla_breached_if_needed, assign_ticket
+from .selectors import tickets_qs, apply_ticket_filters, agent_queue_qs
+
 
 
 class TicketCreateView(APIView):
@@ -27,41 +35,44 @@ class TicketCreateView(APIView):
 
         data = ser.validated_data
 
-        ticket = Ticket.objects.create(
-            created_by=request.user,
-            title=data["title"],
-            description=data["description"],
-            priority=data.get("priority", "medium"),
-        )
+        try:
+            ticket = create_ticket(
+                actor=request.user,
+                title=data["title"],
+                description=data["description"],
+                priority=data.get("priority", "medium"),
+            )
+        except AppError as e:
+            return error_response(e)
 
         return Response(TicketListItemSerializer(ticket).data, status=201)
 
 
 class TicketListView(APIView):
     """
-    GET /api/tickets?page=1&page_size=10
-    - client => faqat o'ziniki
-    - agent/admin => hammasi (keyin filter qo'shamiz)
+    GET /api/tickets?status=open&priority=high&page=1&page_size=10
     """
-    def get(self, request):
-        qs = Ticket.objects.select_related("created_by", "assigned_to").order_by("-created_at")
 
+    def get(self, request):
+        qs = tickets_qs().order_by("-created_at")
+
+        # RBAC: client faqat o'ziniki
         if request.user.role == "client":
             qs = qs.filter(created_by=request.user)
 
+        # filters
+        qs = apply_ticket_filters(qs, request.query_params)
+
         page = int(request.query_params.get("page", "1"))
         page_size = int(request.query_params.get("page_size", "10"))
-        start = (page - 1) * page_size
-        end = start + page_size
-
-        items = qs[start:end]
+        data = paginate_queryset(qs, page=page, page_size=page_size)
 
         return Response(
             {
-                "page": page,
-                "page_size": page_size,
-                "count": qs.count(),
-                "results": TicketListItemSerializer(items, many=True).data,
+                "page": data["page"],
+                "page_size": data["page_size"],
+                "count": data["count"],
+                "results": TicketListItemSerializer(data["results"], many=True).data,
             }
         )
 
@@ -98,6 +109,126 @@ class TicketStatusView(APIView):
                 ticket_id=ticket_id,
                 actor=request.user,
                 new_status=ser.validated_data["status"],
+            )
+        except AppError as e:
+            return error_response(e)
+
+        return Response(TicketListItemSerializer(ticket).data, status=200)
+
+
+#==========================
+# second adding
+#==========================
+class TicketDetailView(APIView):
+    """
+    GET /api/tickets/{id}
+    - client faqat o'ziniki
+    - agent/admin hammasi
+    """
+    def get(self, request, ticket_id):
+        ticket = Ticket.objects.select_related("created_by", "assigned_to") \
+            .prefetch_related("messages", "history") \
+            .get(id=ticket_id)
+
+        # object permission
+        perm = CanViewTicket()
+        if not perm.has_object_permission(request, self, ticket):
+            return Response({"error": {"code": "PERMISSION_DENIED", "message": "Forbidden", "details": {}}}, status=403)
+
+        return Response(TicketDetailSerializer(ticket).data)
+
+
+class TicketMessageCreateView(APIView):
+    """
+    POST /api/tickets/{id}/messages
+    Body: { "body": "..." }
+
+    - client: faqat o'z ticketiga
+    - agent/admin: hammasiga
+    """
+    def post(self, request, ticket_id):
+        ser = MessageCreateSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response(
+                {"error": {"code": "VALIDATION_ERROR", "message": "Invalid input", "details": ser.errors}},
+                status=400,
+            )
+
+        ticket = Ticket.objects.get(id=ticket_id)
+
+        perm = CanWriteTicket()
+        if not perm.has_object_permission(request, self, ticket):
+            return Response({"error": {"code": "PERMISSION_DENIED", "message": "Forbidden", "details": {}}}, status=403)
+
+        try:
+            msg = add_message(ticket_id=ticket_id, actor=request.user, body=ser.validated_data["body"])
+        except AppError as e:
+            return error_response(e)
+
+        return Response(TicketMessageSerializer(msg).data, status=201)
+
+
+# new
+class AgentQueueView(APIView):
+    """
+    GET /api/agent/queue?status=open&page=1&page_size=10
+
+    - faqat agent/admin
+    - default: status=open (work queue)
+    - overdue first ordering
+    """
+    permission_classes = [IsAgentOrAdmin]
+
+    def get(self, request):
+        qs = tickets_qs()
+
+        status = request.query_params.get("status", "open")
+        if status:
+            qs = qs.filter(status=status)
+
+        qs = apply_ticket_filters(qs, request.query_params)
+        qs = agent_queue_qs(qs)
+
+        page = int(request.query_params.get("page", "1"))
+        page_size = int(request.query_params.get("page_size", "10"))
+        data = paginate_queryset(qs, page=page, page_size=page_size)
+
+        # Side-effect: SLA breached audit (only for visible page items)
+        for t in data["results"]:
+            mark_sla_breached_if_needed(ticket=t, actor=request.user)
+
+        return Response(
+            {
+                "page": data["page"],
+                "page_size": data["page_size"],
+                "count": data["count"],
+                "results": TicketListItemSerializer(data["results"], many=True).data,
+            }
+        )
+
+
+# new
+class TicketAssignView(APIView):
+    """
+    POST /api/tickets/{id}/assign
+    Body:
+      { "agent_id": "<uuid>" }
+
+    Faqat admin.
+    """
+    def post(self, request, ticket_id):
+        ser = TicketAssignSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response(
+                {"error": {"code": "VALIDATION_ERROR", "message": "Invalid input", "details": ser.errors}},
+                status=400,
+            )
+
+        try:
+            ticket = assign_ticket(
+                ticket_id=ticket_id,
+                actor=request.user,
+                agent_id=ser.validated_data["agent_id"],
             )
         except AppError as e:
             return error_response(e)

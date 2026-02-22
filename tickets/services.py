@@ -5,7 +5,11 @@ from django.utils import timezone
 
 from common.exceptions import ConflictError, PermissionDenied, NotFoundError
 from users.models import UserRole
-from .models import Ticket, TicketHistory, TicketStatus
+from .models import Ticket, TicketHistory, TicketStatus, TicketMessage
+from .constants import ALLOWED_STATUS_TRANSITIONS, SLA_BY_PRIORITY
+from django.contrib.auth import get_user_model
+
+User = get_user_model()
 
 
 def _history(*, ticket, actor, field, old, new):
@@ -59,23 +63,36 @@ def claim_ticket(*, ticket_id, actor) -> Ticket:
     return ticket
 
 
+# yangilangan change status
 @transaction.atomic
 def change_status(*, ticket_id, actor, new_status: str) -> Ticket:
     """
-    Status change.
-    Business rule:
-      - RESOLVED faqat agent/admin qila oladi
-      - CLOSED ham agent/admin (soddalashtiramiz)
+    Status change with strict flow validation.
+
+    Business rules:
+      - Transition only if allowed
+      - RESOLVED/CLOSED faqat agent/admin
     """
     try:
         ticket = Ticket.objects.select_for_update().get(id=ticket_id)
     except Ticket.DoesNotExist:
         raise NotFoundError("Ticket not found")
 
-    if new_status == TicketStatus.RESOLVED and actor.role not in [UserRole.AGENT, UserRole.ADMIN]:
+    current_status = ticket.status
+
+    # 1️⃣ Flow validation
+    allowed_next = ALLOWED_STATUS_TRANSITIONS.get(current_status, set())
+    if new_status not in allowed_next:
+        raise ConflictError(
+            f"Invalid status transition: {current_status} -> {new_status}",
+            details={"allowed": list(allowed_next)},
+        )
+
+    # 2️⃣ Role-based rule
+    if new_status == TicketStatus.RESOLVED and actor.role not in ["agent", "admin"]:
         raise PermissionDenied("Only agent/admin can resolve tickets")
 
-    if new_status == TicketStatus.CLOSED and actor.role not in [UserRole.AGENT, UserRole.ADMIN]:
+    if new_status == TicketStatus.CLOSED and actor.role not in ["agent", "admin"]:
         raise PermissionDenied("Only agent/admin can close tickets")
 
     old_status = ticket.status
@@ -85,6 +102,153 @@ def change_status(*, ticket_id, actor, new_status: str) -> Ticket:
         ticket.resolved_at = timezone.now()
 
     ticket.save(update_fields=["status", "resolved_at", "updated_at"])
+
     _history(ticket=ticket, actor=actor, field="status", old=old_status, new=new_status)
+
+    return ticket
+
+
+# previous change status
+# @transaction.atomic
+# def change_status(*, ticket_id, actor, new_status: str) -> Ticket:
+#     """
+#     Status change.
+#     Business rule:
+#       - RESOLVED faqat agent/admin qila oladi
+#       - CLOSED ham agent/admin (soddalashtiramiz)
+#     """
+#     try:
+#         ticket = Ticket.objects.select_for_update().get(id=ticket_id)
+#     except Ticket.DoesNotExist:
+#         raise NotFoundError("Ticket not found")
+#
+#     if new_status == TicketStatus.RESOLVED and actor.role not in [UserRole.AGENT, UserRole.ADMIN]:
+#         raise PermissionDenied("Only agent/admin can resolve tickets")
+#
+#     if new_status == TicketStatus.CLOSED and actor.role not in [UserRole.AGENT, UserRole.ADMIN]:
+#         raise PermissionDenied("Only agent/admin can close tickets")
+#
+#     old_status = ticket.status
+#     ticket.status = new_status
+#
+#     if new_status == TicketStatus.RESOLVED:
+#         ticket.resolved_at = timezone.now()
+#
+#     ticket.save(update_fields=["status", "resolved_at", "updated_at"])
+#     _history(ticket=ticket, actor=actor, field="status", old=old_status, new=new_status)
+#
+#     return ticket
+
+
+#==========================
+# second adding
+#==========================
+@transaction.atomic
+def add_message(*, ticket_id, actor, body: str) -> TicketMessage:
+    """
+    Har message ticket history emas, lekin message record — auditning o‘zi.
+    Xohlasang historyga ham "message" event yozsa bo‘ladi.
+    """
+    try:
+        ticket = Ticket.objects.select_for_update().get(id=ticket_id)
+    except Ticket.DoesNotExist:
+        raise NotFoundError("Ticket not found")
+
+    msg = TicketMessage.objects.create(ticket=ticket, author=actor, body=body)
+    return msg
+
+# new
+@transaction.atomic
+def create_ticket(*, actor, title: str, description: str, priority: str) -> Ticket:
+    """
+    Ticket creation:
+    - due_at SLA bilan hisoblanadi
+    - (xohlasang) create event historyga yozish mumkin
+    """
+    from django.utils import timezone
+
+    delta = SLA_BY_PRIORITY.get(priority)
+    due_at = timezone.now() + delta if delta else None
+
+    ticket = Ticket.objects.create(
+        created_by=actor,
+        title=title,
+        description=description,
+        priority=priority,
+        due_at=due_at,
+    )
+    return ticket
+
+
+# new
+@transaction.atomic
+def mark_sla_breached_if_needed(*, ticket: Ticket, actor) -> None:
+    """
+    Overdue bo‘lsa, historyga 1 marta yozamiz.
+    field = "sla"
+    new_value = "breached"
+    """
+    from django.utils import timezone
+
+    if ticket.status != "open" or not ticket.due_at:
+        return
+
+    if ticket.due_at >= timezone.now():
+        return
+
+    exists = TicketHistory.objects.filter(ticket=ticket, field="sla", new_value="breached").exists()
+    if exists:
+        return
+
+    TicketHistory.objects.create(
+        ticket=ticket,
+        actor=actor,
+        field="sla",
+        old_value="",
+        new_value="breached",
+    )
+
+
+# new
+@transaction.atomic
+def assign_ticket(*, ticket_id, actor, agent_id):
+    """
+    Admin agentga assign qiladi.
+
+    - Faqat admin
+    - agent_id roli agent bo‘lishi kerak
+    - history yoziladi
+    """
+    if actor.role != "admin":
+        raise PermissionDenied("Only admin can assign tickets")
+
+    try:
+        ticket = Ticket.objects.select_for_update().get(id=ticket_id)
+    except Ticket.DoesNotExist:
+        raise NotFoundError("Ticket not found")
+
+    try:
+        agent = User.objects.get(id=agent_id)
+    except User.DoesNotExist:
+        raise NotFoundError("Agent not found")
+
+    if agent.role != "agent":
+        raise ConflictError("Assigned user must have agent role")
+
+    old_assigned = ticket.assigned_to_id
+    old_status = ticket.status
+
+    ticket.assigned_to = agent
+
+    # Agar hali open bo‘lsa, in_progress qilamiz
+    if ticket.status == "open":
+        ticket.status = "in_progress"
+
+    ticket.save(update_fields=["assigned_to", "status", "updated_at"])
+
+    _history(ticket=ticket, actor=actor, field="assigned_to", old=old_assigned, new=agent.id)
+
+    if old_status != ticket.status:
+        _history(ticket=ticket, actor=actor, field="status", old=old_status, new=ticket.status)
 
     return ticket
